@@ -1120,6 +1120,8 @@ mod tests {
             assert!(adapter.dedup_inbound_by_platform_message_id());
             assert!(adapter.atomic_inbound_admission());
             let message = crate::services::channel_platform::InboundMessage {
+                embedded_attachments: Vec::new(),
+                embedded_attachments_omitted: 0,
                 platform_message_id: "500".into(),
                 conversation_id: "15551234567".into(),
                 conversation_type: "private".into(),
@@ -1452,6 +1454,7 @@ mod tests {
         crate::config::AppConfig {
             port: 3001,
             auth_device_eight_char_codes: false,
+            resource_request_proof_enabled: false,
             base_url: "http://localhost:3001".to_string(),
             frontend_url: "http://localhost:3000".to_string(),
             cors_allowed_origins: vec![],

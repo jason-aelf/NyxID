@@ -1,6 +1,7 @@
 use crate::models::default_request_header::SecretHeaders;
 use std::sync::Arc;
 
+use futures::TryStreamExt;
 use mongodb::bson::doc;
 use reqwest::Client;
 use url::form_urlencoded;
@@ -431,7 +432,12 @@ pub(crate) fn build_effective_outbound_headers(
         });
     }
     outbound_headers.extend(delegated_headers.iter().cloned());
-    apply_server_owned_headers(outbound_headers, extra_outbound_headers)
+    let mut outbound_headers = apply_server_owned_headers(outbound_headers, extra_outbound_headers);
+    // This authority is minted only for the exact final admitted request. No
+    // caller, catalog default, delegated credential or node route may supply it.
+    outbound_headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case(super::resource_request_proof::HEADER));
+    outbound_headers
 }
 
 pub(crate) fn apply_server_owned_headers(
@@ -1114,6 +1120,7 @@ pub(crate) fn prepare_node_request(
     caller_token: Option<&str>,
     extra_outbound_headers: &[(String, String)],
 ) -> AppResult<PreparedNodeRequest> {
+    super::lark_attachment_tool::refuse_reserved_path(path)?;
     let mut node_delegated = delegated.to_vec();
     extend_with_path_credential(&mut node_delegated, target);
     let prepared = prepare_delegated_request(path, query, &node_delegated)?;
@@ -2786,7 +2793,8 @@ fn is_public_internal_master_credential_service(service: &DownstreamService) -> 
 
 fn is_auto_provisionable_catalog_service(
     service: &DownstreamService,
-    has_provider_requirement: bool,
+    has_any_provider_requirement: bool,
+    has_required_provider_requirement: bool,
 ) -> bool {
     if super::retired_service_service::is_retired(service) {
         return false;
@@ -2796,10 +2804,10 @@ fn is_auto_provisionable_catalog_service(
         && !service.requires_user_credential
         && (service.service_category == "connection" || service.service_category == "internal")
         && service.service_type == "http"
-        && !has_provider_requirement;
+        && !has_required_provider_requirement;
 
     is_truly_no_auth
-        || (!has_provider_requirement && is_public_internal_master_credential_service(service))
+        || (!has_any_provider_requirement && is_public_internal_master_credential_service(service))
 }
 
 fn auto_provision_auth_snapshot(service: &DownstreamService) -> (&str, &str) {
@@ -2865,11 +2873,19 @@ pub(crate) async fn verify_auto_provision_eligibility(
         return super::platform_key_service::require(db, &ds, effective_owner_id).await;
     }
 
-    let spr_count = db
+    // Deserialize all rows before checking required flags. Missing or malformed
+    // policy must fail closed, matching provisioning and reconciliation.
+    let requirements: Vec<ServiceProviderRequirement> = db
         .collection::<ServiceProviderRequirement>(SERVICE_PROVIDER_REQUIREMENTS)
-        .count_documents(doc! { "service_id": catalog_id })
+        .find(doc! { "service_id": catalog_id })
+        .await?
+        .try_collect()
         .await?;
-    if !is_auto_provisionable_catalog_service(&ds, spr_count > 0) {
+    if !is_auto_provisionable_catalog_service(
+        &ds,
+        !requirements.is_empty(),
+        requirements.iter().any(|r| r.required),
+    ) {
         return Err(AppError::NotFound(
             "Service is no longer available".to_string(),
         ));
@@ -3972,6 +3988,7 @@ fn build_minimal_downstream_service(
         default_request_headers: None,
         ws_frame_injections: user_service.ws_frame_injections.clone(),
         developer_app_ids: None,
+        introspection_client_ids: None,
         token_exchange_config,
         anonymous_endpoints: Vec::new(),
         proxy_operation_policy: None,
@@ -4238,6 +4255,45 @@ pub(crate) fn forward_request_with_egress_guard<'a>(
     billing_egress_permit: crate::services::billing::route_inventory::BillingEgressPermit,
     egress_guard: Option<&'a super::assistant_service_execution::HttpEgressGuard<'a>>,
 ) -> futures::future::BoxFuture<'a, Result<reqwest::Response, ForwardRequestError>> {
+    forward_request_with_resource_proof(
+        client,
+        target,
+        method,
+        path,
+        query,
+        headers,
+        body,
+        identity_headers,
+        delegated_credentials,
+        caller_token,
+        token_exchange_cache,
+        cloud_response_cache,
+        extra_outbound_headers,
+        billing_egress_permit,
+        egress_guard,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn forward_request_with_resource_proof<'a>(
+    client: &'a Client,
+    target: &'a ProxyTarget,
+    method: reqwest::Method,
+    path: &'a str,
+    query: Option<&'a str>,
+    headers: reqwest::header::HeaderMap,
+    body: ProxyBody,
+    identity_headers: Vec<(String, String)>,
+    delegated_credentials: Vec<DelegatedCredential>,
+    caller_token: Option<&'a str>,
+    token_exchange_cache: &'a TokenExchangeCache,
+    cloud_response_cache: &'a CloudResponseCache,
+    extra_outbound_headers: Vec<(String, String)>,
+    billing_egress_permit: crate::services::billing::route_inventory::BillingEgressPermit,
+    egress_guard: Option<&'a super::assistant_service_execution::HttpEgressGuard<'a>>,
+    resource_proof: Option<&'a super::resource_request_proof::ReadProofIssuer<'a>>,
+) -> futures::future::BoxFuture<'a, Result<reqwest::Response, ForwardRequestError>> {
     Box::pin(forward_request_with_egress_guard_inner(
         client,
         target,
@@ -4254,6 +4310,7 @@ pub(crate) fn forward_request_with_egress_guard<'a>(
         extra_outbound_headers,
         billing_egress_permit,
         egress_guard,
+        resource_proof,
     ))
 }
 
@@ -4274,7 +4331,9 @@ async fn forward_request_with_egress_guard_inner(
     extra_outbound_headers: Vec<(String, String)>,
     billing_egress_permit: crate::services::billing::route_inventory::BillingEgressPermit,
     egress_guard: Option<&super::assistant_service_execution::HttpEgressGuard<'_>>,
+    resource_proof: Option<&super::resource_request_proof::ReadProofIssuer<'_>>,
 ) -> Result<reqwest::Response, ForwardRequestError> {
+    super::lark_attachment_tool::refuse_reserved_path(path)?;
     if super::telnyx_platform_service::contract(&target.service).is_some() {
         let proof = billing_egress_permit.managed_proof().ok_or_else(|| {
             AppError::BillingProviderUnavailable(
@@ -4681,7 +4740,16 @@ async fn forward_request_with_egress_guard_inner(
             .await
             .map_err(ForwardRequestError::PreDispatchRejected)?;
     }
-    let response = request.send().await?;
+    let response = if let Some(proof) = resource_proof {
+        let mut request = request.build()?;
+        proof
+            .attach(&mut request)
+            .await
+            .map_err(ForwardRequestError::PreDispatchRejected)?;
+        no_redirect_http_client().execute(request).await?
+    } else {
+        request.send().await?
+    };
 
     // Cache successful billing-API responses so a follow-up request
     // with the same body replays from memory. Non-2xx responses are
@@ -6580,6 +6648,7 @@ mod tests {
                 default_request_headers: None,
                 ws_frame_injections: Vec::new(),
                 developer_app_ids: None,
+                introspection_client_ids: None,
                 token_exchange_config: None,
                 anonymous_endpoints: Vec::new(),
                 proxy_operation_policy: None,
@@ -7379,6 +7448,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lark_base_write_reserved_routes_refuse_raw_and_node_forwarding_before_provider_effects()
+     {
+        let vendor = wiremock::MockServer::start().await;
+        let target = make_proxy_target(vendor.uri());
+        for path in [
+            "/nyxid/managed/bitable/apps/base/tables/table/records",
+            "nyxid/managed/bitable/apps/base/tables/table/records",
+            "/open-apis/nyxid/managed/bitable/apps/base/tables/table/records",
+        ] {
+            assert!(
+                super::forward_request(
+                    &Client::new(),
+                    &target,
+                    reqwest::Method::POST,
+                    path,
+                    None,
+                    reqwest::header::HeaderMap::new(),
+                    ProxyBody::Buffered(None),
+                    vec![],
+                    vec![],
+                    None,
+                    &empty_token_cache(),
+                    &empty_response_cache(),
+                    crate::services::billing::route_inventory::internal_node_dispatch_permit()
+                )
+                .await
+                .is_err()
+            );
+            assert!(
+                prepare_node_request(&target, path, None, vec![], &[], &[], None, &[]).is_err()
+            );
+        }
+        assert!(vendor.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn tool_forwarding_never_follows_vendor_redirects() {
         use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
         let vendor = MockServer::start().await;
@@ -7966,6 +8071,7 @@ mod tests {
                 default_request_headers: None,
                 ws_frame_injections: Vec::new(),
                 developer_app_ids: None,
+                introspection_client_ids: None,
                 token_exchange_config: Some(make_lark_token_exchange_config()),
                 anonymous_endpoints: Vec::new(),
                 proxy_operation_policy: None,
@@ -8366,6 +8472,7 @@ mod tests {
                 default_request_headers: None,
                 ws_frame_injections: Vec::new(),
                 developer_app_ids: None,
+                introspection_client_ids: None,
                 token_exchange_config: None,
                 anonymous_endpoints: Vec::new(),
                 proxy_operation_policy: None,
@@ -8608,6 +8715,7 @@ mod tests {
                 default_request_headers: None,
                 ws_frame_injections: Vec::new(),
                 developer_app_ids: None,
+                introspection_client_ids: None,
                 token_exchange_config: None,
                 anonymous_endpoints: Vec::new(),
                 proxy_operation_policy: None,
@@ -8867,6 +8975,7 @@ mod tests {
             default_request_headers: None,
             ws_frame_injections: vec![],
             developer_app_ids: None,
+            introspection_client_ids: None,
             token_exchange_config: None,
             anonymous_endpoints: Vec::new(),
             proxy_operation_policy: None,

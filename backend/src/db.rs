@@ -118,6 +118,7 @@ pub async fn require_transactions(db: &Database) -> Result<(), mongodb::error::E
 /// Uses `create_index` which is idempotent -- if the index already exists
 /// with the same specification it is a no-op.
 pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> {
+    ensure_lark_base_write_indexes(db).await?;
     db.collection::<crate::models::assistant_skill_draft_attempt::AssistantSkillDraftAttempt>(
         crate::models::assistant_skill_draft_attempt::COLLECTION_NAME,
     )
@@ -180,6 +181,46 @@ pub async fn ensure_indexes(db: &Database) -> Result<(), mongodb::error::Error> 
     Ok(())
 }
 
+pub(crate) async fn ensure_lark_base_write_indexes(
+    db: &Database,
+) -> Result<(), mongodb::error::Error> {
+    for (collection, identity) in [
+        (crate::models::lark_base_write::COLLECTION_NAME, "key"),
+        (
+            crate::models::lark_base_write_photo::COLLECTION_NAME,
+            "photo_key",
+        ),
+    ] {
+        db.collection::<Document>(collection)
+            .create_indexes([
+                IndexModel::builder()
+                    .keys(doc! {identity: 1})
+                    .options(IndexOptions::builder().unique(true).build())
+                    .build(),
+                IndexModel::builder().keys(doc! {"user_id": 1}).build(),
+                // Cleanup is transactional with the parent; no independent TTL
+                // may remove a photo reservation or an active dispatch barrier.
+                IndexModel::builder().keys(doc! {"expires_at": 1}).build(),
+            ])
+            .await?;
+    }
+    db.collection::<Document>(crate::models::lark_base_write::COLLECTION_NAME)
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {"state": 1, "deadline_at": 1})
+                .build(),
+        )
+        .await?;
+    db.collection::<Document>(crate::models::lark_base_write_photo::COLLECTION_NAME)
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! {"write_id": 1, "attempt": 1})
+                .build(),
+        )
+        .await?;
+    Ok(())
+}
+
 async fn ensure_core_indexes(db: &Database) -> Result<(), mongodb::error::Error> {
     db.collection::<Document>(crate::services::assistant_service_execution::COLLECTION)
         .create_indexes([
@@ -229,6 +270,7 @@ async fn ensure_core_indexes(db: &Database) -> Result<(), mongodb::error::Error>
     ))
     .await
     .map_err(|_| mongodb::error::Error::custom("Attachment retention index migration failed"))?;
+    crate::services::assistant_channel_media::ensure_indexes(db).await?;
     crate::services::service_history::relay::ensure_indexes(db).await?;
     crate::services::catalog_skill_service::ensure_indexes(db).await?;
     crate::services::assistant_nyxagent::ensure_indexes(db).await?;
@@ -3208,6 +3250,15 @@ async fn ensure_service_indexes(db: &Database) -> Result<(), mongodb::error::Err
         )
         .await?;
 
+    db.collection::<Document>(crate::models::billing_tax_profile::COLLECTION_NAME)
+        .create_index(
+            IndexModel::builder()
+                .keys(doc! { "owner_id": 1 })
+                .options(IndexOptions::builder().unique(true).build())
+                .build(),
+        )
+        .await?;
+
     // ── billing_wallet ──
     let billing_wallet = db.collection::<Document>(crate::models::billing_wallet::COLLECTION_NAME);
     billing_wallet
@@ -6002,6 +6053,7 @@ mod tests {
             default_request_headers: None,
             ws_frame_injections: Vec::new(),
             developer_app_ids: None,
+            introspection_client_ids: None,
             token_exchange_config: None,
             anonymous_endpoints: Vec::new(),
             proxy_operation_policy: None,

@@ -2116,6 +2116,17 @@ async fn handle_tools_list(
     };
 
     let mut services = catalog.services;
+    if let Err(error) = crate::services::lark_attachment_tool::filter_discovery(
+        &state.db,
+        auth.chat.as_ref(),
+        &mut services,
+    )
+    .await
+    {
+        tracing::warn!(code = error.error_code(), "Failed to filter tools");
+        return rpc_error(request.id.clone(), -32603, "Failed to load tools");
+    }
+
     crate::services::agent_operation_scope_service::filter_catalog(
         &auth.assistant_operation_scopes,
         &mut services,
@@ -3135,21 +3146,29 @@ fn dispatch_service_tool<'a>(
         }
 
         let execution_arguments = webhook_execution_arguments(auth, &arguments);
-        let mut prepared =
-            match mcp_service::prepare_proxy_tool_call(service, endpoint, &execution_arguments) {
-                Ok(prepared) => prepared.with_acknowledgement(
-                    auth.chat
-                        .as_ref()
-                        .and_then(|_| arguments["acknowledgement_id"].as_str()),
-                ),
-                Err(e) => {
-                    return tool_result(
-                        request.id.clone(),
-                        &format!("Invalid tool arguments: {e}"),
-                        true,
-                    );
-                }
-            };
+        let mut prepared = match mcp_service::prepare_chat_proxy_tool_call(
+            &state.db,
+            &state.encryption_keys,
+            auth.chat.as_ref(),
+            service,
+            endpoint,
+            &execution_arguments,
+        )
+        .await
+        {
+            Ok(prepared) => prepared.with_acknowledgement(
+                auth.chat
+                    .as_ref()
+                    .and_then(|_| arguments["acknowledgement_id"].as_str()),
+            ),
+            Err(e) => {
+                return tool_result(
+                    request.id.clone(),
+                    &format!("Invalid tool arguments: {e}"),
+                    true,
+                );
+            }
+        };
         if let Err(error) =
             prepared.authorize_agent_operations(&auth.assistant_operation_scopes, service, endpoint)
         {
@@ -3441,6 +3460,7 @@ fn mcp_exec_context<'a>(auth: &'a McpAuthContext) -> mcp_service::McpExecContext
         agent_owner: auth.assistant_agent_owner_id.as_deref(),
         operation_scopes: Some(&auth.assistant_operation_scopes),
         api_key_id: auth.api_key_id.as_deref(),
+        api_key_credential_id: auth.api_key_credential_id.as_deref(),
         allow_all_nodes: auth.allow_all_nodes,
         allowed_node_ids: &auth.allowed_node_ids,
     }
@@ -3911,6 +3931,8 @@ async fn webhook_service_gate(
         crate::services::assistant_nyxagent::identifier(&endpoint.name),
         crate::services::assistant_nyxagent::identifier(&service.service_slug),
     );
+    let materialized_args = prepared.attachment_confirmation_arguments(endpoint, args);
+    let args = materialized_args.as_ref().unwrap_or(args);
     let result = async {
         let gate = acks::confirmation_needed(&state.db, chat, facts, false).await?;
         if let Some(need) = gate.ask()
@@ -4380,17 +4402,25 @@ async fn handle_meta_call_tool(
     }
 
     let execution_arguments = webhook_execution_arguments(auth, &inner_args);
-    let prepared =
-        match mcp_service::prepare_proxy_tool_call(service, endpoint, &execution_arguments) {
-            Ok(prepared) => prepared.with_acknowledgement(
-                auth.chat
-                    .as_ref()
-                    .and_then(|_| inner_args["acknowledgement_id"].as_str()),
-            ),
-            Err(e) => {
-                return tool_result(request_id, &format!("Invalid tool arguments: {e}"), true);
-            }
-        };
+    let prepared = match mcp_service::prepare_chat_proxy_tool_call(
+        &state.db,
+        &state.encryption_keys,
+        auth.chat.as_ref(),
+        service,
+        endpoint,
+        &execution_arguments,
+    )
+    .await
+    {
+        Ok(prepared) => prepared.with_acknowledgement(
+            auth.chat
+                .as_ref()
+                .and_then(|_| inner_args["acknowledgement_id"].as_str()),
+        ),
+        Err(e) => {
+            return tool_result(request_id, &format!("Invalid tool arguments: {e}"), true);
+        }
+    };
     if let Err(error) =
         prepared.authorize_agent_operations(&auth.assistant_operation_scopes, service, endpoint)
     {
@@ -4805,6 +4835,12 @@ async fn load_all_services_for_meta_tools(
         &auth.user_id,
         mcp_node_scope(auth),
         mcp_service_scope(auth),
+    )
+    .await?;
+    crate::services::lark_attachment_tool::filter_discovery(
+        &state.db,
+        auth.chat.as_ref(),
+        &mut services,
     )
     .await?;
     crate::services::agent_operation_scope_service::filter_catalog(
@@ -10774,3 +10810,11 @@ mod image_handler_tests {
 #[cfg(test)]
 #[path = "mcp_resource_tests.rs"]
 mod resource_tests;
+
+#[cfg(test)]
+#[path = "mcp_attachment_upload_tests.rs"]
+mod attachment_upload_tests;
+
+#[cfg(test)]
+#[path = "mcp_lark_base_tests.rs"]
+mod lark_base_tests;
