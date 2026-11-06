@@ -1,5 +1,6 @@
 name: Backend Test Suite
 
+# Development PRs invoke this suite through ci.yml before merge or publication.
 # Compile once per build mode, then partition execution across isolated runners.
 # This reduces elapsed time without increasing CPU or MongoDB contention within
 # a runner. Normal and coverage builds intentionally keep their existing package
