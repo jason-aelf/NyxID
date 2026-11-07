@@ -1,3 +1,4 @@
+# parallel-dev validation trigger: full CI evidence is collected on this fork PR.
 name: CI
 
 on:
