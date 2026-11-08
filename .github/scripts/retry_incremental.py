@@ -8,16 +8,27 @@ and copied to a log so the marker check works without hiding CI diagnostics.
 
 import argparse
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 
 
-RETRY_MARKERS = (
-    "internal compiler error",
-    "incremental compilation",
-    "failed to load dep graph",
-    "dep-graph",
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+INCREMENTAL_DATA = (
+    r"(?:dep[- ]graph(?: file)?|incremental(?: compilation)? "
+    r"(?:cache|directory|file|data))"
+)
+RETRY_DIAGNOSTIC = re.compile(
+    r"^(?:error: )?(?:"
+    r"internal compiler error(?:[:.!]|$)"
+    r"|incremental compilation (?:failure|failed)\b"
+    r"|(?:failed to|could not|cannot|unable to) (?:load|read|decode) "
+    r"(?:the )?" + INCREMENTAL_DATA + r"\b"
+    r"|(?:corrupt(?:ed)?|unreadable) " + INCREMENTAL_DATA + r"\b"
+    r"|" + INCREMENTAL_DATA + r" (?:is |was )?(?:corrupt(?:ed)?|unreadable)\b"
+    r")",
+    re.IGNORECASE,
 )
 DEFAULT_INCREMENTAL_DIRS = (
     Path("target/debug/incremental"),
@@ -27,8 +38,12 @@ DEFAULT_INCREMENTAL_DIRS = (
 
 def should_retry(output):
     """Return whether compiler output identifies a stale incremental failure."""
-    lowered = output.lower()
-    return any(marker in lowered for marker in RETRY_MARKERS)
+    # Match diagnostic leads, not keywords in E-code errors, source gutters,
+    # quoted messages or test names. Cargo's forced color must not hide a lead.
+    return any(
+        RETRY_DIAGNOSTIC.match(ANSI_ESCAPE.sub("", line))
+        for line in output.splitlines()
+    )
 
 
 def run_once(command, log_path, append):
