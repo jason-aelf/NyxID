@@ -13,30 +13,51 @@ Usage:
     coverage_summary.py <component> <label> <threshold> <input.json> <output.json>
 """
 import json
+import math
 import sys
 
 
-def line_pct(doc: dict) -> float:
+def normalize_pct(value: object) -> float:
+    # bool is a number in Python, but is not a coverage measurement.
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        percentage = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+    if not math.isfinite(percentage) or not 0 <= percentage <= 100:
+        return 0.0
+    return percentage
+
+
+def line_pct(doc: object) -> float:
     """Extract total line coverage % from either supported report shape."""
     # cargo-llvm-cov: {"data": [{"totals": {"lines": {"percent": ...}}}]}
-    data = doc.get("data")
-    if isinstance(data, list) and data:
-        totals = data[0].get("totals", {})
-        lines = totals.get("lines", {})
-        if "percent" in lines:
-            return float(lines["percent"])
+    if not isinstance(doc, dict):
+        raise ValueError("coverage report must be an object")
+    if "data" in doc:
+        data = doc["data"]
+        if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+            raise ValueError("invalid cargo-llvm-cov data")
+        totals = data[0].get("totals")
+        if not isinstance(totals, dict):
+            raise ValueError("invalid cargo-llvm-cov totals")
+        lines = totals.get("lines")
+        if not isinstance(lines, dict) or "percent" not in lines:
+            raise ValueError("missing cargo-llvm-cov line percentage")
+        return normalize_pct(lines["percent"])
     # vitest v8 json-summary: {"total": {"lines": {"pct": ...}}}. v8 emits the
     # string "Unknown" when no files match the include glob — treat that (and
     # any non-numeric value) as 0% so the gate fails loudly instead of crashing.
-    total = doc.get("total")
-    if isinstance(total, dict):
-        lines = total.get("lines", {})
-        if "pct" in lines:
-            try:
-                return float(lines["pct"])
-            except (TypeError, ValueError):
-                return 0.0
-    raise SystemExit(f"unrecognized coverage report shape; keys={list(doc)}")
+    if "total" in doc:
+        total = doc["total"]
+        if not isinstance(total, dict):
+            raise ValueError("invalid vitest total")
+        lines = total.get("lines")
+        if not isinstance(lines, dict) or "pct" not in lines:
+            raise ValueError("missing vitest line percentage")
+        return normalize_pct(lines["pct"])
+    raise ValueError(f"unrecognized coverage report shape; keys={list(doc)}")
 
 
 def main() -> None:
@@ -53,7 +74,7 @@ def main() -> None:
         "base_pct": None,
     }
     with open(out_path, "w", encoding="utf-8") as fh:
-        json.dump(summary, fh, indent=2)
+        json.dump(summary, fh, indent=2, allow_nan=False)
     print(f"{label}: head lines {summary['head_pct']}% (threshold {threshold}%)")
 
 
