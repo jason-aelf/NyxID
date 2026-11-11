@@ -83,6 +83,31 @@ class BackendTestSummaryTests(unittest.TestCase):
         self.assertEqual([case["test"] for case in report["attention"]],
                          [case[0] for case in cases])
 
+    def test_shard_durations_include_unavailable_and_keep_ties_stable(self):
+        self.report(1, [("first", "2", []), ("second", "2", []), ("third", "1", [])])
+        self.report(2, [])
+        (self.root / "shard-2/junit.xml").write_text("<broken")
+        report = summarize(self.root, 3)
+        self.assertEqual([shard["shard"] for shard in report["shards"]], [1, 2, 3])
+        self.assertEqual(report["shards"][0]["duration_seconds"], 5.0)
+        self.assertEqual([case["test"] for case in report["shards"][0]["slowest"]],
+                         ["first", "second", "third"])
+        self.assertIsNone(report["shards"][1]["duration_seconds"])
+        self.assertIsNone(report["shards"][2]["duration_seconds"])
+        self.assertEqual(report["counts"], {"passed": 3, "retried": 0, "failed": 0, "skipped": 0})
+        rendered = markdown(report)
+        self.assertIn("JUnit-reported; not job wall-clock time", rendered)
+        self.assertIn("JUnit report unavailable, malformed or empty", rendered)
+
+    def test_duration_sum_overflow_is_unavailable_and_json_safe(self):
+        self.report(1, [("large-a", "1.7e308", []), ("large-b", "1.7e308", [])])
+        report = summarize(self.root, 1)
+        self.assertIsNone(report["shards"][0]["duration_seconds"])
+        self.assertEqual(report["shards"][0]["duration_reason"], "duration total overflow")
+        encoded = __import__("json").dumps(report, allow_nan=False)
+        self.assertIn('"duration_seconds": null', encoded)
+        self.assertIn("duration total overflow", markdown(report))
+
 
 if __name__ == "__main__":
     unittest.main()
