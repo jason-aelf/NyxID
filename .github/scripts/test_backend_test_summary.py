@@ -40,6 +40,33 @@ class BackendTestSummaryTests(unittest.TestCase):
         self.assertEqual([item["shard"] for item in report["unavailable"]], [2, 3])
         self.assertEqual(report["counts"]["failed"], 1)
 
+    def test_shard_inventory_distinguishes_report_states_and_reconciles_counts(self):
+        self.report(1, [("pass", "1", []), ("retry", "2", ["flakyFailure"]),
+                        ("failure", "3", ["flakyFailure", "failure"]),
+                        ("skip", "4", ["skipped"])])
+        self.report(3, [])
+        (self.root / "shard-3/junit.xml").write_text("<broken")
+        # Shard 4 is present but contains no testcase elements.
+        self.report(4, [])
+        self.report(6, [("additional-pass", "0.5", [])])
+
+        report = summarize(self.root, 6)
+
+        self.assertEqual([shard["shard"] for shard in report["shards"]], [1, 2, 3, 4, 5, 6])
+        self.assertEqual([shard["status"] for shard in report["shards"]],
+                         ["available", "missing", "malformed", "empty", "missing", "available"])
+        self.assertEqual(report["shards"][0]["counts"],
+                         {"passed": 1, "retried": 1, "failed": 1, "skipped": 1})
+        for status, total in report["counts"].items():
+            self.assertEqual(total, sum(shard.get("counts", {}).get(status, 0)
+                                        for shard in report["shards"]))
+        rendered = markdown(report)
+        self.assertIn("Shard availability and final results:", rendered)
+        self.assertIn("Shard 2: report missing; results unavailable.", rendered)
+        self.assertIn("Shard 3: report malformed; results unavailable.", rendered)
+        self.assertIn("Shard 4: report empty; results unavailable.", rendered)
+        self.assertIn("Diagnostic evidence only", rendered)
+
     def test_final_failure_takes_precedence_over_a_previous_attempt(self):
         for tag in ("failure", "error", "rerunFailure"):
             with self.subTest(tag=tag):
