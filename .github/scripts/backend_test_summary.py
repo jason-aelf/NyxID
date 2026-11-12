@@ -27,14 +27,26 @@ def summarize(results, count):
         path = results / f"shard-{shard}" / "junit.xml"
         try:
             root = ET.parse(path).getroot()
-        except (OSError, ET.ParseError) as error:
+        except FileNotFoundError as error:
             unavailable.append({"shard": shard, "reason": str(error)})
-            shards.append({"shard": shard, "duration_seconds": None, "slowest": []})
+            shards.append({"shard": shard, "status": "missing",
+                           "duration_seconds": None, "slowest": []})
+            continue
+        except ET.ParseError as error:
+            unavailable.append({"shard": shard, "reason": str(error)})
+            shards.append({"shard": shard, "status": "malformed",
+                           "duration_seconds": None, "slowest": []})
+            continue
+        except OSError as error:
+            unavailable.append({"shard": shard, "reason": str(error)})
+            shards.append({"shard": shard, "status": "unavailable",
+                           "duration_seconds": None, "slowest": []})
             continue
         parsed = root.findall(".//testcase")
         if not parsed:
             unavailable.append({"shard": shard, "reason": "empty test report"})
-            shards.append({"shard": shard, "duration_seconds": None, "slowest": []})
+            shards.append({"shard": shard, "status": "empty",
+                           "duration_seconds": None, "slowest": []})
             continue
         shard_cases = []
         for case in parsed:
@@ -59,6 +71,9 @@ def summarize(results, count):
         duration_seconds = total if math.isfinite(total) else None
         shards.append({
             "shard": shard,
+            "status": "available",
+            "counts": {status: sum(case["status"] == status for case in shard_cases)
+                       for status in ("passed", "retried", "failed", "skipped")},
             "duration_seconds": duration_seconds,
             "duration_reason": None if duration_seconds is not None else "duration total overflow",
             "slowest": sorted(shard_cases, key=lambda case: case["seconds"], reverse=True)[:20],
@@ -90,7 +105,17 @@ def markdown(report):
             continue
         lines.append(f'- Shard {shard["shard"]}: {shard["duration_seconds"]:.3f}s total.')
         for case in shard["slowest"]:
-            lines.append(f'  - {case["seconds"]:.3f}s — {label(case)}')
+            lines.append(f'  - {case["seconds"]:.3f}s - {label(case)}')
+    lines.extend(["", "Shard availability and final results:", ""])
+    for shard in report["shards"]:
+        if shard["status"] == "available":
+            counts = shard["counts"]
+            results = ", ".join(f"{counts[key]} {key}"
+                                 for key in ("passed", "retried", "failed", "skipped"))
+            lines.append(f'- Shard {shard["shard"]}: report available; {results}.')
+        else:
+            lines.append(f'- Shard {shard["shard"]}: report {shard["status"]}; '
+                         "results unavailable.")
     lines.append("")
     for missing in report["unavailable"]:
         lines.append(f'- Shard {missing["shard"]}: JUnit report unavailable, malformed or empty.')
