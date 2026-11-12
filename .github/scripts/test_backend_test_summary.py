@@ -1,4 +1,6 @@
 from pathlib import Path
+import json
+import math
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -55,9 +57,17 @@ class BackendTestSummaryTests(unittest.TestCase):
         self.assertEqual(report["counts"]["passed"], 0)
 
     def test_invalid_times_and_markup_are_safe_to_render(self):
-        self.report(1, [("<tag>`", "NaN", []), ("bad", "unknown", []), ("negative", "-1", [])])
+        self.report(1, [("<tag>`", "NaN", []), ("bad", "unknown", []),
+                        ("negative", "-1", []), ("positive-infinity", "Infinity", []),
+                        ("negative-infinity", "-Infinity", [])])
         report = summarize(self.root, 1)
         self.assertTrue(all(case["seconds"] == 0 for case in report["slowest"]))
+        by_name = {case["test"]: case["seconds"] for case in report["slowest"]}
+        self.assertEqual(by_name["positive-infinity"], 0.0)
+        self.assertEqual(by_name["negative-infinity"], 0.0)
+        self.assertEqual(report["shards"][0]["duration_seconds"], 0.0)
+        self.assertTrue(math.isfinite(report["shards"][0]["duration_seconds"]))
+        json.dumps(report, allow_nan=False)
         self.assertIn("&lt;tag&gt;&#96;", markdown(report))
         self.assertNotIn("<tag>", markdown(report))
 
