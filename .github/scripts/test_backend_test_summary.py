@@ -1,4 +1,6 @@
 from pathlib import Path
+import json
+import math
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -57,10 +59,19 @@ class BackendTestSummaryTests(unittest.TestCase):
                          ["available", "missing", "malformed", "empty", "missing", "available"])
         self.assertEqual(report["shards"][0]["counts"],
                          {"passed": 1, "retried": 1, "failed": 1, "skipped": 1})
+        self.assertEqual(report["shards"][0]["duration_seconds"], 10.0)
+        self.assertEqual([case["test"] for case in report["shards"][0]["slowest"]],
+                         ["skip", "failure", "retry", "pass"])
+        self.assertEqual([shard["duration_seconds"] for shard in report["shards"]],
+                         [10.0, None, None, None, None, 0.5])
         for status, total in report["counts"].items():
             self.assertEqual(total, sum(shard.get("counts", {}).get(status, 0)
                                         for shard in report["shards"]))
         rendered = markdown(report)
+        self.assertIn("Shard 1: 10.000s total.", rendered)
+        self.assertIn("Shard 1: report available; 1 passed, 1 retried, 1 failed, 1 skipped.",
+                      rendered)
+        self.assertIn("Shard 2: duration unavailable (report unavailable).", rendered)
         self.assertIn("Shard availability and final results:", rendered)
         self.assertIn("Shard 2: report missing; results unavailable.", rendered)
         self.assertIn("Shard 3: report malformed; results unavailable.", rendered)
@@ -82,9 +93,17 @@ class BackendTestSummaryTests(unittest.TestCase):
         self.assertEqual(report["counts"]["passed"], 0)
 
     def test_invalid_times_and_markup_are_safe_to_render(self):
-        self.report(1, [("<tag>`", "NaN", []), ("bad", "unknown", []), ("negative", "-1", [])])
+        self.report(1, [("<tag>`", "NaN", []), ("bad", "unknown", []),
+                        ("negative", "-1", []), ("positive-infinity", "Infinity", []),
+                        ("negative-infinity", "-Infinity", [])])
         report = summarize(self.root, 1)
         self.assertTrue(all(case["seconds"] == 0 for case in report["slowest"]))
+        by_name = {case["test"]: case["seconds"] for case in report["slowest"]}
+        self.assertEqual(by_name["positive-infinity"], 0.0)
+        self.assertEqual(by_name["negative-infinity"], 0.0)
+        self.assertEqual(report["shards"][0]["duration_seconds"], 0.0)
+        self.assertTrue(math.isfinite(report["shards"][0]["duration_seconds"]))
+        json.dumps(report, allow_nan=False)
         self.assertIn("&lt;tag&gt;&#96;", markdown(report))
         self.assertNotIn("<tag>", markdown(report))
 
@@ -109,6 +128,31 @@ class BackendTestSummaryTests(unittest.TestCase):
         self.assertEqual(report["counts"]["failed"], len(cases))
         self.assertEqual([case["test"] for case in report["attention"]],
                          [case[0] for case in cases])
+
+    def test_shard_durations_include_unavailable_and_keep_ties_stable(self):
+        self.report(1, [("first", "2", []), ("second", "2", []), ("third", "1", [])])
+        self.report(2, [])
+        (self.root / "shard-2/junit.xml").write_text("<broken")
+        report = summarize(self.root, 3)
+        self.assertEqual([shard["shard"] for shard in report["shards"]], [1, 2, 3])
+        self.assertEqual(report["shards"][0]["duration_seconds"], 5.0)
+        self.assertEqual([case["test"] for case in report["shards"][0]["slowest"]],
+                         ["first", "second", "third"])
+        self.assertIsNone(report["shards"][1]["duration_seconds"])
+        self.assertIsNone(report["shards"][2]["duration_seconds"])
+        self.assertEqual(report["counts"], {"passed": 3, "retried": 0, "failed": 0, "skipped": 0})
+        rendered = markdown(report)
+        self.assertIn("JUnit-reported; not job wall-clock time", rendered)
+        self.assertIn("JUnit report unavailable, malformed or empty", rendered)
+
+    def test_duration_sum_overflow_is_unavailable_and_json_safe(self):
+        self.report(1, [("large-a", "1.7e308", []), ("large-b", "1.7e308", [])])
+        report = summarize(self.root, 1)
+        self.assertIsNone(report["shards"][0]["duration_seconds"])
+        self.assertEqual(report["shards"][0]["duration_reason"], "duration total overflow")
+        encoded = __import__("json").dumps(report, allow_nan=False)
+        self.assertIn('"duration_seconds": null', encoded)
+        self.assertIn("duration total overflow", markdown(report))
 
 
 if __name__ == "__main__":

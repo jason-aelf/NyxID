@@ -29,20 +29,24 @@ def summarize(results, count):
             root = ET.parse(path).getroot()
         except FileNotFoundError as error:
             unavailable.append({"shard": shard, "reason": str(error)})
-            shards.append({"shard": shard, "status": "missing"})
+            shards.append({"shard": shard, "status": "missing",
+                           "duration_seconds": None, "slowest": []})
             continue
         except ET.ParseError as error:
             unavailable.append({"shard": shard, "reason": str(error)})
-            shards.append({"shard": shard, "status": "malformed"})
+            shards.append({"shard": shard, "status": "malformed",
+                           "duration_seconds": None, "slowest": []})
             continue
         except OSError as error:
             unavailable.append({"shard": shard, "reason": str(error)})
-            shards.append({"shard": shard, "status": "unavailable"})
+            shards.append({"shard": shard, "status": "unavailable",
+                           "duration_seconds": None, "slowest": []})
             continue
         parsed = root.findall(".//testcase")
         if not parsed:
             unavailable.append({"shard": shard, "reason": "empty test report"})
-            shards.append({"shard": shard, "status": "empty"})
+            shards.append({"shard": shard, "status": "empty",
+                           "duration_seconds": None, "slowest": []})
             continue
         shard_cases = []
         for case in parsed:
@@ -58,15 +62,21 @@ def summarize(results, count):
                     seconds = 0.0
             except ValueError:
                 seconds = 0.0
-            shard_cases.append({"shard": shard, "binary": case.get("classname", ""),
-                                "test": case.get("name", ""), "status": status,
-                                "seconds": seconds})
-        cases.extend(shard_cases)
+            parsed_case = {"shard": shard, "binary": case.get("classname", ""),
+                           "test": case.get("name", ""), "status": status,
+                           "seconds": seconds}
+            cases.append(parsed_case)
+            shard_cases.append(parsed_case)
+        total = sum(case["seconds"] for case in shard_cases)
+        duration_seconds = total if math.isfinite(total) else None
         shards.append({
             "shard": shard,
             "status": "available",
             "counts": {status: sum(case["status"] == status for case in shard_cases)
                        for status in ("passed", "retried", "failed", "skipped")},
+            "duration_seconds": duration_seconds,
+            "duration_reason": None if duration_seconds is not None else "duration total overflow",
+            "slowest": sorted(shard_cases, key=lambda case: case["seconds"], reverse=True)[:20],
         })
     return {
         "counts": {status: sum(case["status"] == status for case in cases)
@@ -86,8 +96,17 @@ def markdown(report):
 
     lines = ["### Backend test diagnostics", "",
              "Diagnostic evidence only; complete-suite verification is a separate gate.", "",
-             ", ".join(f"{value} {key}" for key, value in report["counts"].items()), ""]
-    lines.extend(["Shard availability and final results:", ""])
+             ", ".join(f"{value} {key}" for key, value in report["counts"].items()), "",
+             "Per-shard testcase durations (JUnit-reported; not job wall-clock time):", ""]
+    for shard in report["shards"]:
+        if shard["duration_seconds"] is None:
+            detail = shard.get("duration_reason", "report unavailable")
+            lines.append(f'- Shard {shard["shard"]}: duration unavailable ({html.escape(detail)}).')
+            continue
+        lines.append(f'- Shard {shard["shard"]}: {shard["duration_seconds"]:.3f}s total.')
+        for case in shard["slowest"]:
+            lines.append(f'  - {case["seconds"]:.3f}s - {label(case)}')
+    lines.extend(["", "Shard availability and final results:", ""])
     for shard in report["shards"]:
         if shard["status"] == "available":
             counts = shard["counts"]
